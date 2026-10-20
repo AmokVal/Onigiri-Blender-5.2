@@ -302,12 +302,12 @@ def _oni_childof_set_inverse(ctx_dict, **kwargs):
 import builtins
 builtins._oni_childof_set_inverse = _oni_childof_set_inverse
 
-
 # === EXPORTADOR COLLADA 1.4.1 Y OPERADORES RESTANTES PARA BLENDER 5.2 ===
 import os
 import math
 import mathutils
 import bmesh
+from .presets import skeleton as skel
 
 def _mat_to_str(mat):
     vals = []
@@ -356,6 +356,25 @@ def _write_oni_collada_141(
                     arm_obj = mod.object
                     break
 
+    # Matriz de orientación global idéntica al exportador C++ de Blender:
+    # En Blender C++ Collada, el eje Forward nativo es Y. Pasar de Y a -X es +90 grados en Z.
+    already_sl_oriented = False
+    if arm_obj and "mShoulderLeft" in arm_obj.data.bones and "mShoulderRight" in arm_obj.data.bones:
+        if arm_obj.data.bones["mShoulderLeft"].head_local.y > arm_obj.data.bones["mShoulderRight"].head_local.y:
+            already_sl_oriented = True
+
+    if apply_global_orientation and not already_sl_oriented:
+        if global_forward == '-X':
+            g_mat = mathutils.Matrix.Rotation(math.radians(90.0), 4, 'Z')
+        elif global_forward == 'X':
+            g_mat = mathutils.Matrix.Rotation(math.radians(-90.0), 4, 'Z')
+        elif global_forward == '-Y':
+            g_mat = mathutils.Matrix.Rotation(math.radians(180.0), 4, 'Z')
+        else:
+            g_mat = mathutils.Matrix.Identity(4)
+    else:
+        g_mat = mathutils.Matrix.Identity(4)
+
     depsgraph = context.evaluated_depsgraph_get()
 
     lines = []
@@ -373,14 +392,12 @@ def _write_oni_collada_141(
     lines.append('  </asset>')
     lines.append('  <library_images/>')
 
-    # Recopilar materiales
     materials = []
     for m_obj in mesh_objs:
         for slot in m_obj.material_slots:
             if slot.material and slot.material not in materials:
                 materials.append(slot.material)
 
-    # library_effects
     lines.append('  <library_effects>')
     for mat in materials:
         mid = mat.name.replace(" ", "_")
@@ -398,7 +415,6 @@ def _write_oni_collada_141(
         lines.append('    </effect>')
     lines.append('  </library_effects>')
 
-    # library_materials
     lines.append('  <library_materials>')
     for mat in materials:
         mid = mat.name.replace(" ", "_")
@@ -407,13 +423,11 @@ def _write_oni_collada_141(
         lines.append('    </material>')
     lines.append('  </library_materials>')
 
-    # library_geometries
     lines.append('  <library_geometries>')
     mesh_skin_data = {}
 
     for m_obj in mesh_objs:
         if apply_modifiers:
-            # Desactivar temporalmente el modificador Armature para obtener la malla en bind pose con otros modificadores aplicados
             arm_mods = []
             for mod in m_obj.modifiers:
                 if mod.type == 'ARMATURE' and mod.show_viewport:
@@ -428,6 +442,10 @@ def _write_oni_collada_141(
         else:
             me = m_obj.data.copy()
 
+        # Transformar los vértices al espacio global + rotación SL
+        mesh_mat = g_mat @ m_obj.matrix_world
+        me.transform(mesh_mat)
+
         if triangulate:
             bm = bmesh.new()
             bm.from_mesh(me)
@@ -440,7 +458,6 @@ def _write_oni_collada_141(
         lines.append(f'    <geometry id="{geom_id}" name="{m_obj.name}">')
         lines.append('      <mesh>')
 
-        # Positions
         pos_floats = []
         for v in me.vertices:
             co = v.co
@@ -457,10 +474,9 @@ def _write_oni_collada_141(
         lines.append('          </technique_common>')
         lines.append('        </source>')
 
-        # Normals (por loop)
         norm_floats = []
         for loop in me.loops:
-            no = loop.normal if hasattr(loop, "normal") and loop.normal.length > 0 else me.vertices[loop.vertex_index].normal
+            no = me.vertices[loop.vertex_index].normal
             norm_floats.extend([f"{no.x:.6f}", f"{no.y:.6f}", f"{no.z:.6f}"])
         l_count = len(me.loops)
         lines.append(f'        <source id="{geom_id}-normals">')
@@ -474,7 +490,6 @@ def _write_oni_collada_141(
         lines.append('          </technique_common>')
         lines.append('        </source>')
 
-        # UVs
         uv_layers = me.uv_layers
         has_uv = len(uv_layers) > 0
         if has_uv:
@@ -496,7 +511,6 @@ def _write_oni_collada_141(
         lines.append(f'          <input semantic="POSITION" source="#{geom_id}-positions"/>')
         lines.append('        </vertices>')
 
-        # Triangles agrupados por material
         mat_tris = {}
         for tri in me.loop_triangles:
             m_idx = tri.material_index
@@ -513,11 +527,9 @@ def _write_oni_collada_141(
             lines.append(f'        <triangles count="{len(tris)}"{mat_attr}>')
             lines.append(f'          <input semantic="VERTEX" source="#{geom_id}-vertices" offset="0"/>')
             lines.append(f'          <input semantic="NORMAL" source="#{geom_id}-normals" offset="1"/>')
-            stride_inputs = 2
             if has_uv:
                 for uv_idx in range(len(uv_layers)):
                     lines.append(f'          <input semantic="TEXCOORD" source="#{geom_id}-map-{uv_idx}" offset="{2 + uv_idx}" set="{uv_idx}"/>')
-                stride_inputs += len(uv_layers)
             p_indices = []
             for tri in tris:
                 for v_i, l_i in zip(tri.vertices, tri.loops):
@@ -532,46 +544,62 @@ def _write_oni_collada_141(
         lines.append('      </mesh>')
         lines.append('    </geometry>')
 
-        # Guardar pesos de vértices para library_controllers
         vgroups = m_obj.vertex_groups
         vg_idx_to_name = {vg.index: vg.name for vg in vgroups}
         mesh_skin_data[m_obj.name] = {
             "v_count": v_count,
             "vg_map": vg_idx_to_name,
             "verts_weights": [[(g.group, g.weight) for g in v.groups] for v in me.vertices],
-            "matrix_world": m_obj.matrix_world.copy(),
+            "matrix_world": mathutils.Matrix.Identity(4),
             "materials": [s.material for s in m_obj.material_slots if s.material]
         }
         bpy.data.meshes.remove(me)
 
     lines.append('  </library_geometries>')
 
-    # library_controllers
+    # Conjunto de huesos válidos de SL en Onigiri (para que devkit.py NUNCA descarte uno ni desfase índices)
+    valid_sl_bones = set(skel.avatar_skeleton.keys()) | {k.replace(" ", "_") for k in skel.avatar_skeleton.keys()}
+
     lines.append('  <library_controllers>')
     if arm_obj and include_armatures:
         arm_name_clean = arm_obj.name.replace(".", "_")
-        # Lista de huesos deformadores
-        export_bones = []
-        for b in arm_obj.data.bones:
-            if deform_bones_only and not b.use_deform:
-                continue
-            export_bones.append(b)
-        if not export_bones:
-            export_bones = list(arm_obj.data.bones)
 
         for m_obj in mesh_objs:
             sdata = mesh_skin_data[m_obj.name]
+            vg_map = sdata["vg_map"]
+
+            used_vg_indices = set()
+            for vw in sdata["verts_weights"]:
+                for g_idx, w_val in vw:
+                    if w_val > 0.00001:
+                        used_vg_indices.add(g_idx)
+            used_vg_names = {vg_map[idx] for idx in used_vg_indices if idx in vg_map}
+            if not used_vg_names:
+                used_vg_names = set(vg_map.values())
+
+            export_bones = []
+            for b in arm_obj.data.bones:
+                if deform_bones_only and not b.use_deform:
+                    continue
+                if b.name in used_vg_names and (b.name in valid_sl_bones or b.name.replace(" ", "_") in valid_sl_bones):
+                    export_bones.append(b)
+
+            if not export_bones:
+                for b in arm_obj.data.bones:
+                    if b.name in valid_sl_bones or b.name.replace(" ", "_") in valid_sl_bones:
+                        export_bones.append(b)
+                        if len(export_bones) >= 110:
+                            break
+
             cid = f"{arm_name_clean}_{m_obj.name}-skin"
             geom_id = f"{m_obj.name}-mesh"
             lines.append(f'    <controller id="{cid}" name="{arm_name_clean}">')
             lines.append(f'      <skin source="#{geom_id}">')
             lines.append(f'        <bind_shape_matrix>{_mat_to_str(sdata["matrix_world"])}</bind_shape_matrix>')
 
-            # Determinar joints usados o del esqueleto
             bone_names = [b.name.replace(" ", "_") for b in export_bones]
             bone_idx_map = {b.name: idx for idx, b in enumerate(export_bones)}
 
-            # source joints (Name_array)
             lines.append(f'        <source id="{cid}-joints">')
             lines.append(f'          <Name_array id="{cid}-joints-array" count="{len(bone_names)}">{" ".join(bone_names)}</Name_array>')
             lines.append('          <technique_common>')
@@ -581,10 +609,9 @@ def _write_oni_collada_141(
             lines.append('          </technique_common>')
             lines.append('        </source>')
 
-            # source bind_poses (float4x4)
             bind_Author_floats = []
             for b in export_bones:
-                inv_mat = (arm_obj.matrix_world @ b.matrix_local).inverted()
+                inv_mat = (g_mat @ arm_obj.matrix_world @ b.matrix_local).inverted()
                 bind_Author_floats.append(_mat_to_str(inv_mat))
             lines.append(f'        <source id="{cid}-bind_poses">')
             lines.append(f'          <float_array id="{cid}-bind_poses-array" count="{len(export_bones) * 16}">{" ".join(bind_Author_floats)}</float_array>')
@@ -595,18 +622,30 @@ def _write_oni_collada_141(
             lines.append('          </technique_common>')
             lines.append('        </source>')
 
-            # source weights
             weight_floats = []
             vcount_list = []
             v_pairs = []
             w_idx = 0
-            vg_map = sdata["vg_map"]
+            last_valid_j = 0
             for vw in sdata["verts_weights"]:
                 valid_vw = []
                 for g_idx, w_val in vw:
                     bname = vg_map.get(g_idx)
+                    if bname and bname not in bone_idx_map:
+                        bname = bname.replace(" ", "_")
                     if bname in bone_idx_map and w_val > 0.00001:
                         valid_vw.append((bone_idx_map[bname], w_val))
+                # Limitar a las 4 influencias más fuertes (estándar SL) y normalizar a 1.0
+                if len(valid_vw) > 4:
+                    valid_vw.sort(key=lambda x: x[1], reverse=True)
+                    valid_vw = valid_vw[:4]
+                total_w = sum(w for _, w in valid_vw)
+                if total_w > 0.00001:
+                    valid_vw = [(j, w / total_w) for j, w in valid_vw]
+                    last_valid_j = valid_vw[0][0]
+                else:
+                    # Evitar vértices huérfanos que se disparan hacia un lado en SL
+                    valid_vw = [(last_valid_j, 1.0)]
                 vcount_list.append(str(len(valid_vw)))
                 for j_idx, w_val in valid_vw:
                     weight_floats.append(f"{w_val:.6f}")
@@ -641,21 +680,19 @@ def _write_oni_collada_141(
             lines.append('    </controller>')
     lines.append('  </library_controllers>')
 
-    # library_visual_scenes
     lines.append('  <library_visual_scenes>')
     lines.append('    <visual_scene id="Scene" name="Scene">')
     if arm_obj:
         arm_id = arm_obj.name.replace(".", "_")
         lines.append(f'      <node id="{arm_id}" name="{arm_obj.name}" type="NODE">')
-        lines.append(f'        <matrix sid="transform">{_mat_to_str(arm_obj.matrix_world)}</matrix>')
+        lines.append(f'        <matrix sid="transform">{_mat_to_str(mathutils.Matrix.Identity(4))}</matrix>')
 
-        # Recursivamente escribir los huesos como nodos JOINT
         def _write_bone_node(bone, indent="        "):
             bname = bone.name.replace(" ", "_")
             if bone.parent:
                 local_mat = bone.parent.matrix_local.inverted() @ bone.matrix_local
             else:
-                local_mat = bone.matrix_local
+                local_mat = g_mat @ arm_obj.matrix_world @ bone.matrix_local
             lines.append(f'{indent}<node id="{bname}" name="{bname}" sid="{bname}" type="JOINT">')
             lines.append(f'{indent}  <matrix sid="transform">{_mat_to_str(local_mat)}</matrix>')
             for child in bone.children:
@@ -668,7 +705,6 @@ def _write_oni_collada_141(
 
         root_bone_name = root_bones[0].name.replace(" ", "_") if root_bones else "mPelvis"
 
-        # Nodos de malla con instance_controller dentro del nodo padre del Armature (como espera devkit.py línea 637)
         for m_obj in mesh_objs:
             cid = f"{arm_id}_{m_obj.name}-skin"
             mid = m_obj.name.replace(".", "_")
@@ -693,7 +729,7 @@ def _write_oni_collada_141(
         for m_obj in mesh_objs:
             mid = m_obj.name.replace(".", "_")
             lines.append(f'      <node id="{mid}" name="{m_obj.name}" type="NODE">')
-            lines.append(f'        <matrix sid="transform">{_mat_to_str(m_obj.matrix_world)}</matrix>')
+            lines.append(f'        <matrix sid="transform">{_mat_to_str(mathutils.Matrix.Identity(4))}</matrix>')
             lines.append(f'        <instance_geometry url="#{m_obj.name}-mesh"/>')
             lines.append('      </node>')
 
@@ -829,8 +865,200 @@ _ONI_EXTRA_OPS = (
 def register_b5_extra_ops():
     for cls in _ONI_EXTRA_OPS:
         try:
+            bpy.utils.unregister_class(cls)
+        except Exception:
+            pass
+        try:
             bpy.utils.register_class(cls)
         except Exception:
             pass
 
 register_b5_extra_ops()
+
+
+# Parche para rigs que ya están orientados hacia +X en Blender (conservando el cálculo anti-squish de Onigiri)
+from . import devkit as _oni_devkit_mod
+from . import rigutils as _oni_rigutils_mod
+from . import utils as _oni_utils_mod
+from .presets import base_data as _oni_base_data
+
+if not hasattr(_oni_devkit_mod, "_orig_get_matrices_b5"):
+    _oni_devkit_mod._orig_get_matrices_b5 = _oni_devkit_mod.get_matrices
+
+def _patched_get_matrices_b5(armature=None, use_bind_pose=False, rotate=True, base=None, report=False):
+    armObj = armature
+    if isinstance(armature, str):
+        armObj = bpy.data.objects.get(armature)
+
+    # Detectar si el rig en Blender YA está orientado hacia +X (Second Life)
+    already_sl_oriented = False
+    if armObj and "mShoulderLeft" in armObj.data.bones and "mShoulderRight" in armObj.data.bones:
+        if armObj.data.bones["mShoulderLeft"].head_local.y > armObj.data.bones["mShoulderRight"].head_local.y:
+            already_sl_oriented = True
+
+    if not already_sl_oriented:
+        return _oni_devkit_mod._orig_get_matrices_b5(
+            armature=armature, use_bind_pose=use_bind_pose, rotate=rotate, base=base, report=report
+        )
+
+    # Si el rig ya está en +X:
+    # base_data (female_neutral, etc.) está en -Y, así que para pasar base_data a +X se rota +90°,
+    # pero las posiciones (matrices[bone]) del rig actual YA están en +X, así que NO se rotan +90° extra.
+    R90_base = mathutils.Matrix.Rotation(math.radians(90.0), 4, 'Z')
+    R90_baseI = R90_base.inverted()
+
+    dae = {
+        'bind_data': {},
+        'bone_data': {},
+        'real_data': {},
+    }
+
+    base_rig = _oni_base_data.female_neutral
+    for bone in base_rig:
+        dmg = mathutils.Matrix(base_rig[bone]['matrix_local'])
+        matI = dmg.inverted() @ dmg.inverted()
+        L_tmp = mathutils.Matrix.Translation(matI.to_translation())
+        dmg = dmg @ L_tmp
+        dmgI = mathutils.Matrix(base_rig[bone]['matrix_local']) @ dmg.inverted()
+        dmgI = R90_base @ (dmgI @ R90_baseI)
+        l_ofs, r_ofs, s_ofs = dmgI.decompose()
+
+        l = (R90_base @ mathutils.Matrix.Translation(mathutils.Matrix(base_rig[bone]['matrix_local']).to_translation())).to_translation()
+        L = mathutils.Matrix.Translation(l)
+
+        r = skel.avatar_skeleton[bone]['rot']
+        rot = [math.radians(a) for a in r]
+        R_mat = mathutils.Euler(rot, 'XYZ').to_matrix().to_4x4()
+        R_ofs = r_ofs.to_matrix().to_4x4()
+        R = R_mat @ R_ofs
+
+        s = [a for a in skel.avatar_skeleton[bone]['scale']]
+        S = mathutils.Matrix()
+        for i in range(3):
+            S[i][i] = s[i]
+        M = L @ R @ S
+        dae['bind_data'][bone] = M.inverted()
+
+    if armObj is not None:
+        is_avaclown = (armObj.get('avastar') is not None) and (armObj.get('avastar_converted') is None)
+        bone_names = _oni_rigutils_mod.normalize(armObj) if is_avaclown else {b.name: b.name for b in armObj.data.bones}
+        bone_rev = {bone_names[sbone]: sbone for sbone in bone_names}
+
+        base_rig_sel = getattr(_oni_base_data, "female_neutral" if base is None else base)
+        base_matrices = {}
+        for bone in base_rig_sel:
+            # Rotamos la matriz base de Onigiri (-Y) a (+X) para compararla en el mismo espacio que el rig (+X)
+            base_matrices[bone] = R90_base @ mathutils.Matrix(base_rig_sel[bone]['matrix_local']) @ R90_baseI
+
+        if base is None:
+            for bone in skel.avatar_skeleton:
+                if bone in bone_rev:
+                    tbone = bone_rev[bone]
+                    base_matrices[bone] = armObj.data.bones[tbone].matrix_local.copy()
+
+        matrices = {}
+        for bone in skel.avatar_skeleton:
+            if bone not in bone_rev:
+                matrices[bone] = base_matrices[bone]
+            else:
+                sbone = bone_rev[bone]
+                matrices[bone] = armObj.data.bones[sbone].matrix_local.copy()
+
+        for bone in matrices:
+            if bone not in bone_rev:
+                continue
+            sbone = bone_rev[bone]
+            boneObj = armObj.data.bones[sbone]
+
+            dmg = base_matrices[bone]
+            matI = dmg.inverted() @ dmg.inverted()
+            dmg = dmg @ mathutils.Matrix.Translation(matI.to_translation())
+            dmgI = matrices[bone] @ dmg.inverted()
+            l_ofs, r_ofs, s_ofs = dmgI.decompose()
+
+            # El rig YA está en +X, usamos su traslación directamente sin girar otros 90°
+            l = (armObj.matrix_world @ matrices[bone]).to_translation()
+            L = mathutils.Matrix.Translation(l)
+
+            r = skel.avatar_skeleton[bone]['rot']
+            rot = [math.radians(a) for a in r]
+            R_mat = mathutils.Euler(rot, 'XYZ').to_matrix().to_4x4()
+            R_ofs = r_ofs.to_matrix().to_4x4()
+            R = R_mat @ R_ofs if use_bind_pose else R_mat
+
+            if is_avaclown:
+                S = _oni_utils_mod.get_stored_scale(boneObj)
+                if skel.avatar_skeleton[bone]['type'] == 'collision':
+                    S = _oni_utils_mod.get_stored_scale(boneObj.parent, S)
+            else:
+                s = [a for a in skel.avatar_skeleton[bone]['scale']]
+                S = mathutils.Matrix()
+                for i in range(3):
+                    S[i][i] = s[i]
+
+            M = L @ R @ S
+            dae['bind_data'][bone] = M.inverted()
+
+    for bone in dae['bind_data']:
+        matbc = dae['bind_data'][bone].inverted()
+        parent = skel.avatar_skeleton[bone]['parent']
+        if bone == "mPelvis" or not parent or parent not in dae['bind_data']:
+            dae['bone_data'][bone] = matbc
+            dae['real_data'][bone] = matbc
+        else:
+            matbpI = dae['bind_data'][parent]
+            matjc = matbpI @ matbc
+            dae['bone_data'][bone] = matjc
+            dae['real_data'][bone] = matjc
+
+    return dae
+
+_oni_devkit_mod.get_matrices = _patched_get_matrices_b5
+
+
+class POSE_OT_oni_group_add(bpy.types.Operator):
+    bl_idname = "pose.group_add"
+    bl_label = "Add Bone Group (Onigiri B5 Compat)"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj and obj.type == 'ARMATURE':
+            obj.pose.bone_groups.new(name="Group")
+        return {'FINISHED'}
+
+
+class POSE_OT_oni_group_unassign(bpy.types.Operator):
+    bl_idname = "pose.group_unassign"
+    bl_label = "Unassign Bone Group (Onigiri B5 Compat)"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj and obj.type == 'ARMATURE':
+            for pbone in obj.pose.bones:
+                if pbone.bone.select:
+                    pbone.bone_group = None
+        return {'FINISHED'}
+
+
+class POSE_OT_oni_group_remove(bpy.types.Operator):
+    bl_idname = "pose.group_remove"
+    bl_label = "Remove Bone Group (Onigiri B5 Compat)"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj and obj.type == 'ARMATURE':
+            bg = obj.pose.bone_groups
+            if bg.active:
+                bg.remove(bg.active)
+        return {'FINISHED'}
+
+for _cls in (POSE_OT_oni_group_add, POSE_OT_oni_group_unassign, POSE_OT_oni_group_remove):
+    try:
+        bpy.utils.unregister_class(_cls)
+    except Exception:
+        pass
+    try:
+        bpy.utils.register_class(_cls)
+    except Exception:
+        pass
+
